@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""Linux process search and inspection utility."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+PROC_ROOT = Path('/proc')
+SELF_PID = os.getpid()
+PF_KTHREAD = 0x00200000
+PS_FIELDS = (
+    'uid=', 'user=', 'pid=', 'ppid=', 'pcpu=', 'pmem=', 'rss=', 'vsz=',
+    'time=', 'etimes=', 'lstart=', 'tty=', 'stat=', 'comm=', 'args='
+)
+SORT_FIELDS = {'cpu', 'mem', 'rss', 'vsz', 'time', 'pid', 'ppid', 'user', 'cmd'}
+
+
+@dataclass
+class ProcessRecord:
+    uid: int
+    user: str
+    pid: int
+    ppid: int
+    cpu_percent: float
+    memory_percent: float
+    rss_kib: int
+    vsz_kib: int
+    cpu_time_seconds: int
+    cpu_time: str
+    elapsed_seconds: int
+    start_time: str
+    tty: str
+    state: str
+    executable: str
+    command: str
+    kernel_name: str
+    search_names: list[str]
+
+    @property
+    def rss_bytes(self) -> int:
+        return self.rss_kib * 1024
+
+    @property
+    def vsz_bytes(self) -> int:
+        return self.vsz_kib * 1024
+
+    @property
+    def rss_human(self) -> str:
+        return human_size(self.rss_bytes)
+
+    @property
+    def vsz_human(self) -> str:
+        return human_size(self.vsz_bytes)
+
+    def to_json_dict(self) -> dict[str, object]:
+        data = asdict(self)
+        data['rss_bytes'] = self.rss_bytes
+        data['rss_human'] = self.rss_human
+        data['vsz_bytes'] = self.vsz_bytes
+        data['vsz_human'] = self.vsz_human
+        return data
+
+
+@dataclass
+class Options:
+    search: str | None
+    user: str | None
+    parent: int | None
+    pid: int | None
+    show_rss: bool
+    min_rss_bytes: int | None
+    show_vsz: bool
+    min_vsz_bytes: int | None
+    show_time: bool
+    min_time_seconds: int | None
+    show_cpu: bool
+    min_cpu_percent: float | None
+    show_mem: bool
+    min_mem_percent: float | None
+    extend: bool
+    sort: str | None
+    limit: int | None
+    no_header: bool
+    json: bool
+
+
+class PssError(Exception):
+    pass
+
+
+def parse_float(value: str, label: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f'invalid {label}: {value!r}') from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError(f'{label} cannot be negative')
+    return number
+
+
+def parse_nonnegative_int(value: str, label: str) -> int:
+    try:
+        number = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f'invalid {label}: {value!r}') from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError(f'{label} cannot be negative')
+    return number
+
+
+def parse_positive_int(value: str, label: str) -> int:
+    number = parse_nonnegative_int(value, label)
+    if number == 0:
+        raise argparse.ArgumentTypeError(f'{label} must be greater than zero')
+    return number
+
+
+_SIZE_RE = re.compile(r'^\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[kmgtpe]?)(?:i?b)?\s*$', re.I)
+_TIME_SUFFIX_RE = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$', re.I)
+
+
+def parse_size(value: str) -> int:
+    match = _SIZE_RE.match(value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f'invalid size {value!r}; use values such as 100K, 100M, 2G, or 1T'
+        )
+    multipliers = {'': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3,
+                   'T': 1024**4, 'P': 1024**5, 'E': 1024**6}
+    return int(float(match.group('number')) * multipliers[match.group('unit').upper()])
+
+
+def parse_time_value(value: str) -> int:
+    text = value.strip()
+    match = _TIME_SUFFIX_RE.match(text)
+    if match:
+        return int(float(match.group(1)) * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[match.group(2).lower()])
+    if text.isdigit():
+        return int(text)
+    days = 0
+    clock = text
+    if '-' in text:
+        day_text, clock = text.split('-', 1)
+        if not day_text.isdigit():
+            raise argparse.ArgumentTypeError(f'invalid CPU time: {value!r}')
+        days = int(day_text)
+    parts = clock.split(':')
+    if len(parts) not in (2, 3) or not all(part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            f'invalid CPU time {value!r}; use seconds, 5m, 2h, HH:MM:SS, or D-HH:MM:SS'
+        )
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = map(int, parts)
+    else:
+        hours, minutes, seconds = map(int, parts)
+    if minutes >= 60 or seconds >= 60:
+        raise argparse.ArgumentTypeError(f'invalid CPU time: {value!r}')
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def human_size(byte_count: int) -> str:
+    value = float(byte_count)
+    for unit in ('B', 'K', 'M', 'G', 'T', 'P', 'E'):
+        if abs(value) < 1024.0 or unit == 'E':
+            if unit == 'B':
+                return f'{int(value)} B'
+            if value >= 100:
+                return f'{value:.0f} {unit}'
+            if value >= 10:
+                return f'{value:.1f} {unit}'
+            return f'{value:.2f} {unit}'
+        value /= 1024.0
+    return f'{byte_count} B'
+
+
+def parse_ps_time(value: str) -> int:
+    text = value.strip()
+    days = 0
+    if '-' in text:
+        day_text, text = text.split('-', 1)
+        days = int(day_text)
+    parts = text.split(':')
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = map(int, parts)
+    elif len(parts) == 3:
+        hours, minutes, seconds = map(int, parts)
+    else:
+        return 0
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def format_cpu_time(seconds: int) -> str:
+    days, remainder = divmod(max(0, seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f'{days}-{hours:02d}:{minutes:02d}:{seconds:02d}' if days else f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+
+def read_proc_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding='utf-8', errors='replace').strip()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return ''
+
+
+def read_proc_argv(pid_path: Path) -> list[str]:
+    try:
+        raw = (pid_path / 'cmdline').read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return []
+    return [part.decode('utf-8', errors='replace') for part in raw.split(b'\0') if part]
+
+
+
+def read_proc_flags(pid_path: Path) -> int:
+    """Return Linux process flags from /proc/PID/stat."""
+    try:
+        raw = (pid_path / 'stat').read_text(encoding='utf-8', errors='replace').strip()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return 0
+    close_paren = raw.rfind(')')
+    if close_paren == -1:
+        return 0
+    fields = raw[close_paren + 1:].strip().split()
+    if len(fields) <= 6:
+        return 0
+    try:
+        return int(fields[6], 10)
+    except ValueError:
+        return 0
+
+def read_executable_path(pid_path: Path) -> str:
+    try:
+        return os.readlink(pid_path / 'exe').strip()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return ''
+
+
+def basename_without_deleted_suffix(path: str) -> str:
+    cleaned = path[:-10] if path.endswith(' (deleted)') else path
+    return os.path.basename(cleaned.rstrip('/'))
+
+
+def normalize_program_name(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ''
+    if text.startswith('[') and text.endswith(']'):
+        return text
+    first_token = text.split(None, 1)[0]
+    if ':' in first_token:
+        first_token = first_token.split(':', 1)[0]
+    return basename_without_deleted_suffix(first_token)
+
+
+def unique_casefold(values: Iterable[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = value.strip()
+        if cleaned and cleaned.casefold() not in seen:
+            seen.add(cleaned.casefold())
+            output.append(cleaned)
+    return output
+
+
+def reconstruct_extended_command(executable_path: str, kernel_name: str,
+                                 argv: Sequence[str], ps_command: str) -> str:
+    raw_command = ' '.join(argv) if argv else ps_command.strip()
+    if not raw_command:
+        return executable_path or kernel_name or '[unknown]'
+    if not executable_path:
+        return raw_command
+
+    exe_base = normalize_program_name(executable_path)
+    colon_index = raw_command.find(':')
+    if colon_index != -1:
+        raw_prefix = normalize_program_name(raw_command[:colon_index])
+        if raw_prefix and exe_base and raw_prefix.casefold() == exe_base.casefold():
+            return executable_path + raw_command[colon_index:]
+
+    if argv:
+        argv0_base = normalize_program_name(argv[0])
+        if argv0_base and exe_base and argv0_base.casefold() == exe_base.casefold():
+            return ' '.join([executable_path, *argv[1:]])
+
+    try:
+        parsed = shlex.split(raw_command, posix=True)
+    except ValueError:
+        parsed = raw_command.split()
+    if parsed:
+        first_base = normalize_program_name(parsed[0])
+        if first_base and exe_base and first_base.casefold() == exe_base.casefold():
+            return executable_path + raw_command[len(parsed[0]):]
+    return raw_command
+
+
+def build_process_identity(pid: int, ps_comm: str, ps_command: str) -> tuple[str, str, str, list[str]]:
+    pid_path = PROC_ROOT / str(pid)
+    proc_comm = read_proc_text(pid_path / 'comm')
+    argv = read_proc_argv(pid_path)
+    executable_path = read_executable_path(pid_path)
+    process_flags = read_proc_flags(pid_path)
+    kernel_name = proc_comm or ps_comm or '[unknown]'
+
+    if process_flags & PF_KTHREAD:
+        raw_kernel_name = (proc_comm or ps_comm or 'unknown').strip()
+        if raw_kernel_name.startswith('[') and raw_kernel_name.endswith(']'):
+            search_name = raw_kernel_name[1:-1]
+            display_name = raw_kernel_name
+        else:
+            search_name = raw_kernel_name
+            display_name = f'[{raw_kernel_name}]'
+        return display_name, display_name, raw_kernel_name, unique_casefold([search_name])
+
+    kernel_base = normalize_program_name(kernel_name)
+    ps_comm_base = normalize_program_name(ps_comm)
+    exe_base = normalize_program_name(executable_path)
+
+    if executable_path:
+        executable = executable_path
+    elif kernel_base:
+        executable = kernel_base
+    elif ps_comm_base:
+        executable = ps_comm_base
+    else:
+        executable = '[unknown]'
+
+    command = reconstruct_extended_command(executable_path, kernel_name, argv, ps_command)
+    search_names = unique_casefold(x for x in (exe_base, kernel_base, ps_comm_base) if x)
+    return executable, command, kernel_name, search_names
+
+
+def run_ps() -> str:
+    command = ['ps', 'ww', '-eo', ','.join(PS_FIELDS), '--no-headers']
+    try:
+        completed = subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True,
+                                   encoding='utf-8', errors='replace')
+    except FileNotFoundError as exc:
+        raise PssError('ps command was not found') from exc
+    except subprocess.CalledProcessError as exc:
+        raise PssError(exc.stderr.strip() or f'ps exited with status {exc.returncode}') from exc
+    return completed.stdout
+
+
+def parse_ps_output(output: str) -> list[ProcessRecord]:
+    records: list[ProcessRecord] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(None, 18)
+        if len(parts) < 19:
+            continue
+        try:
+            uid = int(parts[0]); user = parts[1]; pid = int(parts[2]); ppid = int(parts[3])
+            cpu_percent = float(parts[4]); memory_percent = float(parts[5])
+            rss_kib = int(parts[6]); vsz_kib = int(parts[7]); cpu_time_text = parts[8]
+            elapsed_seconds = int(parts[9]); start_time = f'{parts[11]}{parts[12]}'
+            tty = parts[15]; state = parts[16]; ps_comm = parts[17]; ps_command = parts[18]
+        except (ValueError, IndexError):
+            continue
+        if pid == SELF_PID:
+            continue
+        executable, command, kernel_name, search_names = build_process_identity(pid, ps_comm, ps_command)
+        cpu_seconds = parse_ps_time(cpu_time_text)
+        records.append(ProcessRecord(
+            uid, user, pid, ppid, cpu_percent, memory_percent, rss_kib, vsz_kib,
+            cpu_seconds, format_cpu_time(cpu_seconds), elapsed_seconds, start_time,
+            tty, state, executable, command, kernel_name, search_names
+        ))
+    return records
+
+
+def resolve_user_filter(value: str) -> tuple[int | None, str | None]:
+    text = value.strip()
+    if not text:
+        raise PssError('user filter cannot be empty')
+    if text.isdigit():
+        uid = int(text)
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            username = None
+        return uid, username
+    try:
+        entry = pwd.getpwnam(text)
+    except KeyError as exc:
+        raise PssError(f'unknown user: {text}') from exc
+    return entry.pw_uid, entry.pw_name
+
+
+def filter_records(records: Iterable[ProcessRecord], options: Options) -> list[ProcessRecord]:
+    selected: list[ProcessRecord] = []
+    user_uid = user_name = None
+    if options.user is not None:
+        user_uid, user_name = resolve_user_filter(options.user)
+    needle = options.search.casefold() if options.search else None
+    for record in records:
+        if needle and not any(needle in name.casefold() for name in record.search_names):
+            continue
+        if user_uid is not None and record.uid != user_uid and (user_name is None or record.user != user_name):
+            continue
+        if options.parent is not None and record.ppid != options.parent:
+            continue
+        if options.pid is not None and record.pid != options.pid:
+            continue
+        if options.min_cpu_percent is not None and record.cpu_percent < options.min_cpu_percent:
+            continue
+        if options.min_mem_percent is not None and record.memory_percent < options.min_mem_percent:
+            continue
+        if options.min_rss_bytes is not None and record.rss_bytes < options.min_rss_bytes:
+            continue
+        if options.min_vsz_bytes is not None and record.vsz_bytes < options.min_vsz_bytes:
+            continue
+        if options.min_time_seconds is not None and record.cpu_time_seconds < options.min_time_seconds:
+            continue
+        selected.append(record)
+    return selected
+
+
+def sort_records(records: list[ProcessRecord], field: str | None) -> list[ProcessRecord]:
+    if not field:
+        return records
+    descending = field in {'cpu', 'mem', 'rss', 'vsz', 'time'}
+    keys = {
+        'cpu': lambda r: r.cpu_percent, 'mem': lambda r: r.memory_percent,
+        'rss': lambda r: r.rss_bytes, 'vsz': lambda r: r.vsz_bytes,
+        'time': lambda r: r.cpu_time_seconds, 'pid': lambda r: r.pid,
+        'ppid': lambda r: r.ppid, 'user': lambda r: (r.user.casefold(), r.pid),
+        'cmd': lambda r: (r.executable.casefold(), r.pid),
+    }
+    return sorted(records, key=keys[field], reverse=descending)
+
+
+def build_columns(options: Options) -> list[tuple[str, str, str]]:
+    columns = [('UID', 'left', 'user'), ('PID', 'right', 'pid'),
+               ('PPID', 'right', 'ppid'), ('CPU%', 'right', 'cpu'),
+               ('MEM%', 'right', 'mem')]
+    if options.show_rss:
+        columns.append(('RSS', 'right', 'rss'))
+    if options.show_vsz:
+        columns.append(('VSZ', 'right', 'vsz'))
+    if options.show_time:
+        columns.append(('CPUt', 'right', 'time'))
+    columns.append(('CMD', 'left', 'command' if options.extend else 'executable'))
+    return columns
+
+
+def get_column_value(record: ProcessRecord, kind: str) -> str:
+    values = {
+        'user': record.user, 'pid': str(record.pid), 'ppid': str(record.ppid),
+        'cpu': f'{record.cpu_percent:.1f}', 'mem': f'{record.memory_percent:.1f}',
+        'rss': record.rss_human, 'vsz': record.vsz_human, 'time': record.cpu_time,
+        'command': record.command, 'executable': record.executable,
+    }
+    return values[kind]
+
+
+def render_table(records: Sequence[ProcessRecord], options: Options) -> str:
+    columns = build_columns(options)
+    widths = [max(len(header), max((len(get_column_value(r, kind)) for r in records), default=0))
+              for header, _, kind in columns]
+    lines: list[str] = []
+    if not options.no_header:
+        lines.append('  '.join(header.rjust(width) if align == 'right' else header.ljust(width)
+                               for (header, align, _), width in zip(columns, widths)))
+        lines.append('  '.join('=' * width for width in widths))
+    for record in records:
+        lines.append('  '.join(
+            get_column_value(record, kind).rjust(width) if align == 'right'
+            else get_column_value(record, kind).ljust(width)
+            for (_, align, kind), width in zip(columns, widths)
+        ))
+    return '\n'.join(lines)
+
+
+def looks_like_number(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def looks_like_size(value: str) -> bool:
+    return _SIZE_RE.match(value) is not None
+
+
+def looks_like_time(value: str) -> bool:
+    try:
+        parse_time_value(value)
+        return True
+    except argparse.ArgumentTypeError:
+        return False
+
+
+def optional_value_preprocess(argv: Sequence[str]) -> list[str]:
+    output: list[str] = []
+    index = 0
+    optional_flags = {
+        '-r': ('--real', looks_like_size), '--real': ('--real', looks_like_size),
+        '-v': ('--vsz', looks_like_size), '--vsz': ('--vsz', looks_like_size),
+        '-t': ('--time', looks_like_time), '--time': ('--time', looks_like_time),
+        '-c': ('--cpu', looks_like_number), '--cpu': ('--cpu', looks_like_number),
+        '-m': ('--mem', looks_like_number), '--mem': ('--mem', looks_like_number),
+    }
+    while index < len(argv):
+        token = argv[index]
+        if token in optional_flags:
+            canonical, validator = optional_flags[token]
+            output.append(canonical)
+            next_token = argv[index + 1] if index + 1 < len(argv) else None
+            if next_token is not None and not next_token.startswith('-') and validator(next_token):
+                output.append(next_token)
+                index += 2
+                continue
+            output.append('__SHOW_ONLY__')
+            index += 1
+            continue
+        output.append(token)
+        index += 1
+    return output
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='pss',
+        description='Search Linux processes by executable identity and display concise process information.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''examples:
+  pss ssh
+  pss --user root
+  pss python -c 20 -m 2 -r 100M
+  pss --sort rss --limit 10
+  pss -x dhcp
+  pss --pid 985 --json'''
+    )
+    parser.add_argument('search', nargs='?', help='case-insensitive executable-name substring')
+    parser.add_argument('-u', '--user', metavar='USER', help='filter by username or numeric UID')
+    parser.add_argument('-p', '--parent', metavar='PID', type=lambda v: parse_nonnegative_int(v, 'parent PID'), help='show direct children of PID')
+    parser.add_argument('--pid', metavar='PID', type=lambda v: parse_nonnegative_int(v, 'PID'), help='show one PID')
+    parser.add_argument('-r', '--real', nargs='?', const='__SHOW_ONLY__', metavar='SIZE', help='show RSS; optionally require minimum RSS')
+    parser.add_argument('-v', '--vsz', nargs='?', const='__SHOW_ONLY__', metavar='SIZE', help='show VSZ; optionally require minimum VSZ')
+    parser.add_argument('-t', '--time', nargs='?', const='__SHOW_ONLY__', metavar='TIME', help='show CPU time; optionally require minimum CPU time')
+    parser.add_argument('-c', '--cpu', nargs='?', const='__SHOW_ONLY__', metavar='PERCENT', help='show CPU%%; optionally require minimum CPU%%')
+    parser.add_argument('-m', '--mem', nargs='?', const='__SHOW_ONLY__', metavar='PERCENT', help='show MEM%%; optionally require minimum MEM%%')
+    parser.add_argument('-x', '--extend', action='store_true', help='show resolved executable path plus command/title detail')
+    parser.add_argument('--sort', choices=sorted(SORT_FIELDS), help='sort field')
+    parser.add_argument('--limit', metavar='N', type=lambda v: parse_positive_int(v, 'limit'), help='show at most N results')
+    parser.add_argument('--no-header', action='store_true', help='suppress table headers')
+    parser.add_argument('--json', action='store_true', help='emit full process records as JSON')
+    return parser
+
+
+def parse_metric_option(value, parser, parser_function):
+    if value is None:
+        return False, None
+    if value == '__SHOW_ONLY__':
+        return True, None
+    try:
+        return True, parser_function(value)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+
+
+def parse_options(argv: Sequence[str]) -> Options:
+    parser = build_parser()
+    ns = parser.parse_args(optional_value_preprocess(argv))
+    show_rss, min_rss = parse_metric_option(ns.real, parser, parse_size)
+    show_vsz, min_vsz = parse_metric_option(ns.vsz, parser, parse_size)
+    show_time, min_time = parse_metric_option(ns.time, parser, parse_time_value)
+    show_cpu, min_cpu = parse_metric_option(ns.cpu, parser, lambda v: parse_float(v, 'CPU percentage'))
+    show_mem, min_mem = parse_metric_option(ns.mem, parser, lambda v: parse_float(v, 'memory percentage'))
+    return Options(ns.search, ns.user, ns.parent, ns.pid, show_rss, min_rss,
+                   show_vsz, min_vsz, show_time, min_time, show_cpu, min_cpu,
+                   show_mem, min_mem, ns.extend, ns.sort, ns.limit,
+                   ns.no_header, ns.json)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    options = parse_options(sys.argv[1:] if argv is None else argv)
+    try:
+        records = sort_records(filter_records(parse_ps_output(run_ps()), options), options.sort)
+        if options.limit is not None:
+            records = records[:options.limit]
+        if options.json:
+            json.dump([r.to_json_dict() for r in records], sys.stdout, indent=2, ensure_ascii=False)
+            sys.stdout.write('\n')
+        else:
+            output = render_table(records, options)
+            if output:
+                print(output)
+        return 0
+    except PssError as exc:
+        print(f'pss: {exc}', file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+

@@ -1,0 +1,430 @@
+#!/bin/bash
+
+###############################################################################
+# Locate a usable tar executable
+###############################################################################
+
+# Expected base-system tar locations.
+TAR_OPENBSD='/bin/tar'
+TAR_FREEBSD='/usr/bin/tar'
+TAR_NETBSD='/bin/tar'
+TAR_DRAGONFLYBSD='/usr/bin/tar'
+TAR_SOLARIS='/usr/bin/tar'
+TAR_ILLUMOS='/usr/bin/tar'
+TAR_HPUX='/usr/bin/tar'
+TAR_AIX='/usr/bin/tar'
+TAR_DARWIN='/usr/bin/tar'
+TAR_REDHAT='/usr/bin/tar'
+TAR_ARCH='/usr/bin/tar'
+TAR_DEBIAN='/usr/bin/tar'
+TAR_SUSE='/usr/bin/tar'
+TAR_ALPINE='/bin/tar'
+TAR_GENTOO='/bin/tar'
+TAR_VOID='/usr/bin/tar'
+TAR_SLACKWARE='/bin/tar'
+TAR_LINUX_GENERIC='/usr/bin/tar'
+TAR_CMD=''
+TAR_EXPECTED=''
+OS_NAME=''
+LINUX_ID=''
+LINUX_ID_LIKE=''
+
+###############################################################################
+# First check whether tar is already available through PATH.
+###############################################################################
+TAR_PATH_RESULT=$(command -v tar 2>/dev/null || :)
+if [ -n "$TAR_PATH_RESULT" ] && [ -f "$TAR_PATH_RESULT" ] && [ -x "$TAR_PATH_RESULT" ]; then
+	TAR_CMD=$TAR_PATH_RESULT
+fi
+
+
+###############################################################################
+# If tar was not found through PATH, determine the expected system location.
+###############################################################################
+if [ -z "$TAR_CMD" ]; then
+	OS_NAME=$(uname -s 2>/dev/null || printf '%s\n' unknown)
+
+	case "$OS_NAME" in
+	OpenBSD)
+		TAR_EXPECTED=$TAR_OPENBSD
+		;;
+
+	FreeBSD)
+		TAR_EXPECTED=$TAR_FREEBSD
+		;;
+
+	NetBSD)
+		TAR_EXPECTED=$TAR_NETBSD
+		;;
+
+	DragonFly)
+		TAR_EXPECTED=$TAR_DRAGONFLYBSD
+		;;
+
+	Darwin)
+		TAR_EXPECTED=$TAR_DARWIN
+		;;
+
+	SunOS)
+		# Solaris and illumos both normally provide /usr/bin/tar.
+		TAR_EXPECTED=$TAR_SOLARIS
+		;;
+
+	HP-UX)
+		TAR_EXPECTED=$TAR_HPUX
+		;;
+
+	AIX)
+		TAR_EXPECTED=$TAR_AIX
+		;;
+
+	Linux)
+		if [ -r /etc/os-release ]; then
+			LINUX_ID=$( sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | sed -n '1p' | tr -d '"' )
+			LINUX_ID_LIKE=$( sed -n 's/^ID_LIKE=//p' /etc/os-release 2>/dev/null | sed -n '1p' | tr -d '"' )
+		fi
+
+		case "$LINUX_ID" in
+		debian|ubuntu|linuxmint|pop|raspbian|kali|devuan)
+			TAR_EXPECTED=$TAR_DEBIAN
+			;;
+
+		rhel|centos|fedora|rocky|almalinux|ol|amzn)
+			TAR_EXPECTED=$TAR_REDHAT
+			;;
+
+		arch|manjaro|endeavouros|artix|garuda)
+			TAR_EXPECTED=$TAR_ARCH
+			;;
+
+		opensuse*|sles|sled)
+			TAR_EXPECTED=$TAR_SUSE
+			;;
+
+		alpine)
+			TAR_EXPECTED=$TAR_ALPINE
+			;;
+
+		gentoo)
+			TAR_EXPECTED=$TAR_GENTOO
+			;;
+
+		void)
+			TAR_EXPECTED=$TAR_VOID
+			;;
+
+		slackware)
+			TAR_EXPECTED=$TAR_SLACKWARE
+			;;
+
+		*)
+			# Handle derivatives whose ID is unfamiliar but whose
+			# ID_LIKE identifies the parent distribution family.
+
+			case " $LINUX_ID_LIKE " in
+			*" debian "*|*" ubuntu "*)
+				TAR_EXPECTED=$TAR_DEBIAN
+				;;
+
+			*" rhel "*|*" fedora "*|*" centos "*)
+				TAR_EXPECTED=$TAR_REDHAT
+				;;
+
+			*" arch "*)
+				TAR_EXPECTED=$TAR_ARCH
+				;;
+
+			*" suse "*|*" opensuse "*)
+				TAR_EXPECTED=$TAR_SUSE
+				;;
+
+			*)
+				TAR_EXPECTED=$TAR_LINUX_GENERIC
+				;;
+
+			esac
+			;;
+
+		esac
+		;;
+
+        *)
+			# Unknown Unix or Unix-like operating system. No OS-specific
+			# assumption is made here; the fallback paths below will be tried.
+			TAR_EXPECTED=''
+			;;
+	esac
+
+	###########################################################################
+	# Validate the expected location for the detected operating system.
+	###########################################################################
+
+	if [ -n "$TAR_EXPECTED" ] && [ -f "$TAR_EXPECTED" ] && [ -x "$TAR_EXPECTED" ]; then
+		TAR_CMD=$TAR_EXPECTED
+	fi
+fi
+
+
+###############################################################################
+# Final fallback for unusual installations or an unknown Unix-like OS.
+###############################################################################
+
+if [ -z "$TAR_CMD" ]; then
+	for TAR_CANDIDATE in \
+	/usr/bin/tar \
+	/bin/tar \
+	/usr/local/bin/tar \
+	/usr/sbin/tar \
+	/sbin/tar \
+	/usr/sfw/bin/gtar \
+	/usr/local/bin/gtar \
+	/opt/local/bin/gtar \
+	/opt/homebrew/bin/gtar
+	do
+		if [ -f "$TAR_CANDIDATE" ] && [ -x "$TAR_CANDIDATE" ]; then
+			TAR_CMD=$TAR_CANDIDATE
+			break
+		fi
+	done
+fi
+
+
+###############################################################################
+# Abort if no usable tar executable was found.
+###############################################################################
+
+if [ -z "$TAR_CMD" ]; then
+	echo
+	printf '%s\n' "tarcp: error: tar is not available in PATH and could not be found" "in a known system location." >&2
+
+	if [ -n "$OS_NAME" ]; then
+		printf 'tarcp: detected operating system: %s\n' "$OS_NAME" >&2
+	fi
+
+	if [ -n "$LINUX_ID" ]; then
+		printf 'tarcp: detected Linux distribution: %s\n' "$LINUX_ID" >&2
+	fi
+
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Validate source and target arguments
+# Arguments:
+#   $1 = existing source directory
+#   $2 = target directory; created when it does not already exist
+###############################################################################
+usage() {
+	printf '\nUsage: %s <Source_Path> <Target_Path>\n' "$0" >&2
+}
+
+###############################################################################
+# Require the source argument.
+###############################################################################
+
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+	echo
+	printf '%s\n' "tarcp: error: Source path required." >&2
+	usage
+	echo
+	exit 1
+fi
+
+SOURCE_PATH=$1
+
+###############################################################################
+# Require the target argument.
+###############################################################################
+
+if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+	echo
+	printf '%s\n' "tarcp: error: Target path required." >&2
+	usage
+	echo
+	exit 1
+fi
+
+TARGET_PATH=$2
+
+###############################################################################
+# Validate the source path.
+###############################################################################
+
+if [ ! -e "$SOURCE_PATH" ]; then
+	echo
+	printf "tarcp: error: Path, '%s', does not exist; please specify a valid source directory.\n" "$SOURCE_PATH" >&2
+	usage
+	echo
+	exit 1
+fi
+
+if [ ! -d "$SOURCE_PATH" ]; then
+	echo
+	printf "tarcp: error: Path, '%s', is not a directory; please specify a valid source directory.\n" "$SOURCE_PATH" >&2
+	usage
+	echo
+	exit 1
+fi
+
+###############################################################################
+# If the target already exists, it must be a writable directory.
+###############################################################################
+
+if [ -e "$TARGET_PATH" ]; then
+
+	if [ ! -d "$TARGET_PATH" ]; then
+		echo
+		printf "tarcp: error: Target path, '%s', exists but is not a directory.\n" "$TARGET_PATH" >&2
+		echo
+		exit 1
+	fi
+
+	if [ ! -w "$TARGET_PATH" ]; then
+		echo
+		printf "tarcp: error: Target directory, '%s', is not writable.\n" "$TARGET_PATH" >&2
+		printf '%s\n' "tarcp: Try running this command with sudo if administrative access is appropriate." >&2
+		echo
+		exit 1
+	fi
+
+fi
+
+###############################################################################
+# If the target does not exist, find its nearest existing parent directory.
+###############################################################################
+
+if [ ! -e "$TARGET_PATH" ]; then
+
+	TARGET_PARENT=$TARGET_PATH
+
+	while [ ! -e "$TARGET_PARENT" ]; 
+	do
+		NEXT_PARENT=$(dirname -- "$TARGET_PARENT" 2>/dev/null)
+
+		if [ -z "$NEXT_PARENT" ] || [ "$NEXT_PARENT" = "$TARGET_PARENT" ]; then
+			break
+		fi
+
+		TARGET_PARENT=$NEXT_PARENT
+	done
+
+	if [ ! -d "$TARGET_PARENT" ]; then
+		echo
+		printf "tarcp: error: Parent path, '%s', is not a directory.\n" "$TARGET_PARENT" >&2
+		echo
+		exit 1
+	fi
+
+	if [ ! -w "$TARGET_PARENT" ]; then
+		echo
+		printf "tarcp: error: Cannot create target directory, '%s'.\n" "$TARGET_PATH" >&2
+		printf "tarcp: Parent directory, '%s', is not writable.\n" "$TARGET_PARENT" >&2
+		printf '%s\n' "tarcp: Try running this command with sudo if administrative access is appropriate." >&2
+		echo
+		exit 1
+	fi
+fi
+
+###############################################################################
+# Create the target directory when it does not exist.
+###############################################################################
+
+if [ ! -d "$TARGET_PATH" ]; then
+	if ! mkdir -p -- "$TARGET_PATH"; then
+		echo
+		printf "tarcp: error: Failed to create target directory, '%s'.\n" "$TARGET_PATH" >&2
+		printf '%s\n' "tarcp: Try running this command with sudo if administrative access is appropriate." >&2
+		echo
+		exit 1
+	fi
+fi
+
+###############################################################################
+# Verify that the target now exists, is a directory, and is writable.
+###############################################################################
+
+if [ ! -d "$TARGET_PATH" ]; then
+	echo
+	printf "tarcp: error: Target directory, '%s', does not exist and could not be created.\n" \
+	"$TARGET_PATH" >&2
+	echo
+	exit 1
+fi
+
+if [ ! -w "$TARGET_PATH" ]; then
+	echo
+	printf "tarcp: error: Target directory, '%s', is not writable.\n" "$TARGET_PATH" >&2
+	printf '%s\n' "tarcp: Try running this command with sudo if administrative access is appropriate." >&2
+	echo
+	exit 1
+fi
+
+
+###############################################################################
+# Copy source directory contents into target directory.
+###############################################################################
+
+# invoke TAR_CMD to copy from SOURCE_PATH to TARGET_PATH.
+
+echo
+echo "Copying... "
+echo
+
+filecounter=0;
+TAR_CREATE_RC=-1
+TAR_EXTRACT_RC=-1
+OUTPUT_LOOP_RC=-1
+
+(
+	cd "$SOURCE_PATH" &&
+	"$TAR_CMD" -cf - .
+) |
+(
+	cd "$TARGET_PATH" &&
+	"$TAR_CMD" -xpvf -
+) |
+while IFS= read -r stdout; do
+	file=$(printf '%s\n' "$stdout" | sed 's#^\./##')
+	((filecounter++))
+	printf '[%s] %s/%s -> %s/%s\n' "$filecounter" "$SOURCE_PATH" "$file" "$TARGET_PATH" "$file"
+done
+
+PIPE_RC=("${PIPESTATUS[@]}")
+
+# Sanity check
+if [ "${#PIPE_RC[@]}" -ne 3 ]; then
+	echo "tarcp: internal error: expected 3 pipeline exit codes, got ${#PIPE_RC[@]}." >&2
+	exit 255
+fi
+
+TAR_CREATE_RC=${PIPE_RC[0]}
+TAR_EXTRACT_RC=${PIPE_RC[1]}
+OUTPUT_LOOP_RC=${PIPE_RC[2]}
+
+if [[ "$TAR_CREATE_RC" == "0" ]] && [[ "$TAR_EXTRACT_RC" == "0" ]]; then
+	echo
+	echo "$0 completed successfully."
+	echo
+	exit 0
+else
+
+	echo
+	echo "$0 did not complete successfully."
+	echo
+	printf '  Error codes: %s:%s\n' "$TAR_CREATE_RC" "$TAR_EXTRACT_RC" >&2
+	echo
+
+	ERRORCODE=-1;
+
+	if [[ "$TAR_CREATE_RC" != "0" ]]; then
+		ERRORCODE=$TAR_CREATE_RC;
+	fi
+	
+	if [[ "$TAR_EXTRACT_RC" != "0" ]]; then
+		ERRORCODE=$TAR_EXTRACT_RC;
+	fi
+
+	exit $ERRORCODE;
+fi
+

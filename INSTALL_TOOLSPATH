@@ -1,0 +1,369 @@
+#!/bin/bash
+
+###############################################################################
+# INSTALL_TOOLPATH
+###############################################################################
+
+###############################################################################
+# Determine the absolute directory containing this script.
+###############################################################################
+
+TOOL_PATH=$(
+	cd "$(dirname "$0")" 2>/dev/null &&
+	pwd -P
+)
+
+if [ -z "$TOOL_PATH" ] || [ ! -d "$TOOL_PATH" ]; then
+	echo
+	printf '%s\n' "Error: Could not determine the script directory." >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Figure out arguments
+###############################################################################
+
+SUDO_MODE=0
+CUSTOM_TARGET=0
+CUSTOM_TOOL_PATH=""
+
+for ARG in "$@"; do
+	case "$ARG" in
+		--sudo)
+			SUDO_MODE=1
+			;;
+
+		-h|--help)
+			echo
+			echo "Usage:"
+			echo "  $0 [--sudo]"
+			echo
+			echo "Modes:"
+			echo "  Default"
+			echo "      Install tool path to the user's PATH."
+			echo
+			echo "  --sudo"
+			echo "      Install the tool path to sudo secure_path."
+			echo "      This mode requires root privileges."
+			echo
+			echo "Examples:"
+			echo "  $0"
+			echo "  sudo $0 --sudo"
+			echo
+			exit 0
+			;;
+
+		-*)
+			echo
+			printf "Error: Unknown option: %s\n\n" "$ARG" >&2
+			exit 1
+			;;
+
+		*)
+			if [[ "$CUSTOM_TARGET" -eq 1 ]]; then
+				echo
+				printf "Error: Multiple target directories specified.\n\n" >&2
+				echo
+				exit 1
+			fi
+
+			CUSTOM_TOOL_PATH=$ARG
+			CUSTOM_TARGET=1
+
+			if [[ ! -d "$CUSTOM_TOOL_PATH" ]]; then
+				echo
+				printf "Error: specified path, '$CUSTOM_TOOL_PATH', does not exist.\n\n" >&2
+				echo
+				exit 1
+
+			fi
+
+			;;
+	esac
+done
+
+if [[ -d "$CUSTOM_TOOL_PATH" ]]; then
+	TOOL_PATH=$CUSTOM_TOOL_PATH
+fi
+
+if  [ ! -d "$TOOL_PATH" ]; then
+	echo
+	printf '%s\n' "Error: Tools directory, '$TOOL_PATH' does not exist." >&2
+	echo
+	exit 1
+fi
+
+MARKER="# Added by INSTALL_PATH ${TOOL_PATH}"
+
+###############################################################################
+# Determine whether this script was sourced.
+###############################################################################
+
+IS_SOURCED='0'
+
+if [ -n "${BASH_VERSION:-}" ]; then
+	(return 0 2>/dev/null) && IS_SOURCED='1'
+elif [ -n "${ZSH_VERSION:-}" ]; then
+	case "${ZSH_EVAL_CONTEXT:-}" in
+		*:file)
+			IS_SOURCED='1'
+			;;
+	esac
+elif [ -n "${KSH_VERSION:-}" ]; then
+	(return 0 2>/dev/null) && IS_SOURCED='1'
+fi
+
+###############################################################################
+# Exit or return without terminating the user's current shell.
+###############################################################################
+
+finish()
+{
+	RC=$1
+
+	if [ "$IS_SOURCED" = '1' ]; then
+		return "$RC"
+	else
+		exit "$RC"
+	fi
+}
+
+###############################################################################
+# Validate /opt/tools.
+###############################################################################
+
+if [ ! -e "$TOOL_PATH" ]; then
+	printf "\nError: '%s' does not exist.\n" \
+		"$TOOL_PATH" >&2
+	printf "Install the tools into '%s' and run this command again.\n\n" \
+		"$TOOL_PATH" >&2
+	finish 1
+fi
+
+if [ ! -d "$TOOL_PATH" ]; then
+	printf "\nError: '%s' exists but is not a directory.\n\n" \
+		"$TOOL_PATH" >&2
+	finish 1
+fi
+
+###############################################################################
+# Check whether /opt/tools is already in the current PATH.
+###############################################################################
+
+PATH_PRESENT='0'
+
+case ":${PATH:-}:" in
+	*:"$TOOL_PATH":*)
+		PATH_PRESENT='1'
+		;;
+esac
+
+###############################################################################
+# Determine the user's shell.
+###############################################################################
+
+LOGIN_SHELL=${SHELL:-/bin/sh}
+SHELL_NAME=${LOGIN_SHELL##*/}
+
+case "$SHELL_NAME" in
+	bash)
+		STARTUP_FILE="$HOME/.bashrc"
+		PATH_LINE='case ":$PATH:" in *:/opt/tools:*) ;; *) export PATH="/opt/tools:$PATH" ;; esac'
+		;;
+
+	zsh)
+		STARTUP_FILE="$HOME/.zshrc"
+		PATH_LINE='case ":$PATH:" in *:/opt/tools:*) ;; *) export PATH="/opt/tools:$PATH" ;; esac'
+		;;
+
+	ksh|ksh88|ksh93|mksh|pdksh)
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE='case ":$PATH:" in *:/opt/tools:*) ;; *) export PATH="/opt/tools:$PATH" ;; esac'
+		;;
+
+	csh)
+		STARTUP_FILE="$HOME/.cshrc"
+		PATH_LINE='if ( "$path" !~ *"/opt/tools"* ) set path = ( /opt/tools $path )'
+		;;
+
+	tcsh)
+		STARTUP_FILE="$HOME/.tcshrc"
+		PATH_LINE='if ( "$path" !~ *"/opt/tools"* ) set path = ( /opt/tools $path )'
+		;;
+
+	fish)
+		STARTUP_FILE="$HOME/.config/fish/config.fish"
+		PATH_LINE='contains -- /opt/tools $PATH; or set -gx PATH /opt/tools $PATH'
+		;;
+
+	sh|dash|ash)
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE='case ":$PATH:" in *:/opt/tools:*) ;; *) export PATH="/opt/tools:$PATH" ;; esac'
+		;;
+
+	*)
+		printf "\nINSTALL_TOOLPATH: warning: unrecognized shell '%s'.\n" \
+			"$LOGIN_SHELL" >&2
+		printf "Using '%s/.profile'.\n" "$HOME" >&2
+
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE='case ":$PATH:" in *:/opt/tools:*) ;; *) export PATH="/opt/tools:$PATH" ;; esac'
+		;;
+esac
+
+###############################################################################
+# Create the startup-file parent directory when required, such as for fish.
+###############################################################################
+
+STARTUP_DIR=${STARTUP_FILE%/*}
+
+if [ "$STARTUP_DIR" != "$STARTUP_FILE" ] && [ ! -d "$STARTUP_DIR" ]; then
+	if ! mkdir -p "$STARTUP_DIR"; then
+		printf "\nError: Could not create '%s'.\n\n" \
+			"$STARTUP_DIR" >&2
+		finish 1
+	fi
+fi
+
+###############################################################################
+# Add the PATH configuration unless already installed.
+###############################################################################
+
+
+##SUDO_MODE
+
+if [[ "$SUDO_MODE" == "1" ]]; then
+
+	## Configure for Sudo
+	if [ "$(id -u)" -eq 0 ]; then
+	
+		echo
+		echo "Adding ''$TOOL_PATH' to sudo secure_path..."
+		echo
+	
+		SUDOERS_FILE="/etc/sudoers.d/unix_tools"
+	
+		if [ -f "$SUDOERS_FILE" ] && grep -Fq "$TOOL_PATH" "$SUDOERS_FILE"; then
+			echo "$TOOL_PATH is already configured in sudo secure_path."
+			echo
+		else
+			CURRENT_SUDO_PATH="$(sudo -V 2>/dev/null |
+				sed -n 's/^[[:space:]]*Value to override user'\''s \$PATH with: //p' |
+				head -n 1)"
+	
+			if [ -z "$CURRENT_SUDO_PATH" ]; then
+				echo "Error: Unable to determine sudo secure_path." >&2
+				echo
+				exit 1
+			fi
+	
+			NEW_SUDO_PATH="${TOOL_PATH}:${CURRENT_SUDO_PATH}"
+	
+			printf 'Defaults secure_path="%s"\n' "$NEW_SUDO_PATH" > "$SUDOERS_FILE"
+			chmod 0440 "$SUDOERS_FILE"
+	
+			if ! visudo -cf "$SUDOERS_FILE"; then
+				echo "Error: Invalid sudoers configuration." >&2
+				rm -f "$SUDOERS_FILE"
+				echo
+				exit 1
+			fi
+	
+			echo "$TOOL_PATH added to sudo secure_path."
+			echo
+		fi
+	
+	else
+	
+		echo
+		echo "This option requires root privileges."
+		echo;
+		exit 1;
+	
+	fi
+
+else
+
+	ALREADY_CONFIGURED='0'
+	
+	if [ -f "$STARTUP_FILE" ]; then
+		if grep -F "$MARKER" "$STARTUP_FILE" >/dev/null 2>&1; then
+			ALREADY_CONFIGURED='1'
+		fi
+	fi
+	
+	if [ "$ALREADY_CONFIGURED" = '0' ]; then
+		{
+			printf '\n%s\n' "$MARKER"
+			printf '%s\n' "$PATH_LINE"
+		} >> "$STARTUP_FILE"
+	
+		if [ "$?" != '0' ]; then
+			printf "\nError: Could not update '%s'.\n\n" \
+				"$STARTUP_FILE" >&2
+			finish 1
+		fi
+	
+		printf "\nAdded '%s' to \$PATH in file:\n  %s\n" "$TOOL_PATH" "$STARTUP_FILE"
+	else
+		printf "\n'%s' is already configured in \$PATH in:\n  %s\n" \
+			"$TOOL_PATH" "$STARTUP_FILE"
+	fi
+
+fi
+
+###############################################################################
+# Update the current shell when sourced.
+###############################################################################
+
+if [[ "$SUDO_MODE" == "0" ]]; then
+
+	if [ "$IS_SOURCED" = '1' ]; then
+		case ":${PATH:-}:" in
+			*:"$TOOL_PATH":*)
+				:
+				;;
+			*)
+				PATH="$TOOL_PATH:${PATH:-}"
+				export PATH
+				;;
+		esac
+	
+		printf "\nCurrent shell PATH updated successfully.\n\n"
+		finish 0
+	fi
+
+fi
+
+###############################################################################
+# An executed child process cannot modify its parent shell.
+###############################################################################
+
+if [[ "$SUDO_MODE" == "0" ]]; then
+
+	if [ "$PATH_PRESENT" = '1' ]; then
+		printf "\n'%s' is already present in the current PATH.\n\n" "$TOOL_PATH"
+	else
+		printf '\nPATH configuration completed.\n'
+		printf 'To update this current shell immediately, run:\n\n'
+	
+		case "$SHELL_NAME" in
+			csh|tcsh)
+				printf '  source "%s"\n\n' "$STARTUP_FILE"
+				;;
+	
+			fish)
+				printf '  source "%s"\n\n' "$STARTUP_FILE"
+				;;
+	
+			*)
+				printf '  . "%s"\n\n' "$STARTUP_FILE"
+				;;
+		esac
+	fi
+
+fi
+
+finish 0
+

@@ -1,0 +1,292 @@
+#!/bin/bash
+
+DEFAULT_TARGET_DIR='/opt/tools'
+
+###############################################################################
+# Determine the absolute directory containing this script.
+###############################################################################
+
+SCRIPT_DIR=$(
+	cd "$(dirname "$0")" 2>/dev/null &&
+	pwd -P
+)
+
+if [[ -z "$SCRIPT_DIR" ]] || [[ ! -d "$SCRIPT_DIR" ]]; then
+	echo
+	printf '%s\n' "Error: Could not determine the script directory." >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Determine if installer is running from original unix_tool repo or moved.
+###############################################################################
+UNIX_TOOLS_CHECK=0;
+if [[ -f "$SCRIPT_DIR/LICENSE" ]] && [[ -f "$SCRIPT_DIR/README.md" ]] && [[ -x "$SCRIPT_DIR/tarcp" ]]; then
+	UNIX_TOOLS_CHECK=1;
+else
+	echo
+	printf '%s\n' "Error: Could not determine complete unix_tools repo." >&2
+	printf '%s\n' "       Please redownload from:" >&2
+	printf '%s\n' "       git clone https://github.com/sajtu/unix_tools.git" >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Select target directory.
+###############################################################################
+
+
+if [[ -n "${1:-}" ]]; then
+	TARGET_DIR=$1
+else
+	TARGET_DIR=$DEFAULT_TARGET_DIR
+fi
+
+###############################################################################
+# Validate target.
+###############################################################################
+
+if [[ -z "$TARGET_DIR" ]]; then
+	echo
+	echo "Error: Target directory is empty." >&2
+	echo
+	exit 1
+fi
+
+if [[ "$TARGET_DIR" == "/" ]]; then
+	echo
+	echo "Error: Installing directly into '/' is not allowed." >&2
+	echo
+	exit 1
+fi
+
+###############################################################################
+# Check existing target.
+###############################################################################
+
+if [[ -e "$TARGET_DIR" ]]; then
+
+	if [[ ! -d "$TARGET_DIR" ]]; then
+		echo
+		printf "Error: '%s' exists but is not a directory.\n" \
+			"$TARGET_DIR" >&2
+		echo
+		exit 1
+	fi
+
+	if [[ ! -w "$TARGET_DIR" ]] || [[ ! -x "$TARGET_DIR" ]]; then
+		if [[ "$(id -u)" != "0" ]]; then
+			echo
+			printf "Error: Root access is required to install to '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+			exit 1
+		fi
+
+		echo
+		printf "Error: Cannot write to '%s'.\n\n" \
+			"$TARGET_DIR" >&2
+		exit 1
+	fi
+
+###############################################################################
+# Check missing target.
+###############################################################################
+
+else
+	NEAREST_EXISTING_PARENT=$TARGET_DIR
+
+	while [[ ! -e "$NEAREST_EXISTING_PARENT" ]]; do
+		NEXT_PARENT=$(dirname "$NEAREST_EXISTING_PARENT" 2>/dev/null)
+
+		if [[ -z "$NEXT_PARENT" ]] || [[ "$NEXT_PARENT" == "$NEAREST_EXISTING_PARENT" ]]; then
+			break
+		fi
+
+		NEAREST_EXISTING_PARENT=$NEXT_PARENT
+	done
+
+	if [[ ! -d "$NEAREST_EXISTING_PARENT" ]]; then
+		echo
+		printf "Error: '%s' is not a valid parent directory.\n\n" \
+			"$NEAREST_EXISTING_PARENT" >&2
+		exit 1
+	fi
+
+	###############################################################################
+	# Check for proper permission.
+	###############################################################################
+
+	if [[ ! -w "$NEAREST_EXISTING_PARENT" ]] ||  [[ ! -x "$NEAREST_EXISTING_PARENT" ]]; then
+
+		if [[ "$(id -u)" != "0" ]]; then
+			echo
+			printf "Error: Root access is required to create '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+			exit 1
+		fi
+
+		echo
+		printf "Error: Cannot create '%s'.\n\n" \
+			"$TARGET_DIR" >&2
+		exit 1
+	fi
+
+	###############################################################################
+	# Confirm directory creation.
+	###############################################################################
+
+	echo
+	printf "Target directory '%s' does not exist.\n" "$TARGET_DIR"
+	printf "Create it and install there? [y/N]: "
+	IFS= read -r CREATE_REPLY
+
+	case "$CREATE_REPLY" in
+		Y|y|YES|Yes|yes)
+			;;
+		*)
+			echo
+			echo "Installation cancelled."
+			echo
+			exit 1
+			;;
+	esac
+
+	###############################################################################
+	# Create target directory.
+	###############################################################################
+
+	if ! mkdir -p "$TARGET_DIR"; then
+		echo
+
+		if [[ "$(id -u)" != "0" ]]; then
+			printf "Error: Root access may be required to create '%s'.\n" \
+				"$TARGET_DIR" >&2
+			printf "Please run: sudo %s" "$0" >&2
+
+			if [[ -n "${1:-}" ]]; then
+				printf " '%s'" "$TARGET_DIR" >&2
+			fi
+
+			printf '\n\n' >&2
+		else
+			printf "Error: Failed to create '%s'.\n\n" \
+				"$TARGET_DIR" >&2
+		fi
+
+		exit 1
+	fi
+fi
+
+###############################################################################
+# Verify target directory.
+###############################################################################
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+	echo
+	printf "Error: Target directory '%s' does not exist.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+if [[ ! -w "$TARGET_DIR" ]] || [[ ! -x "$TARGET_DIR" ]]; then
+	echo
+	printf "Error: Cannot install to '%s'.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+###############################################################################
+# Set target permissions.
+###############################################################################
+
+if ! chmod 755 "$TARGET_DIR"; then
+	echo
+	printf "Error: Failed to set permissions on '%s'.\n\n" \
+		"$TARGET_DIR" >&2
+	exit 1
+fi
+
+printf '\nInstallation target: %s\n' "$TARGET_DIR"
+
+(
+cd $SCRIPT_DIR;
+
+if [[ -f "LICENSE" ]] && [[ -f "README.md" ]] && [[ -x "tarcp" ]]; then
+
+	printf '\nInstalling: %s\n' "$TARGET_DIR"
+
+	for i in $(ls -a | egrep -v "^\.|LICENSE|README.md")
+	do
+	
+		if [[ -d "$SCRIPT_DIR/${i}" ]]; then
+
+			$SCRIPT_DIR/tarcp $SCRIPT_DIR/${i} $TARGET_DIR/${i} 1>/dev/null 2>&1;
+
+			if [[ -d "$TARGET_DIR/${i}" ]]; then
+
+				echo " i d ${i}/"
+
+			else
+				echo "   d ${i}/ [FAILED]"
+			fi
+
+
+		elif [[ -x "$SCRIPT_DIR/${i}" ]]; then
+
+			cp -ap $SCRIPT_DIR/${i} $TARGET_DIR/${i}
+			chmod uga+x $TARGET_DIR/${i}
+			
+			if [[ -x "$TARGET_DIR/${i}" ]]; then
+				echo " i x ${i}*"
+			else
+				echo "   x ${i}* [FAILED]"
+			fi
+
+		else
+			echo "     ${i}"
+		fi
+		
+	done;
+
+	if [[ -x "$TARGET_DIR/tarcp" ]] && [[ -x "$TARGET_DIR/INSTALL_PATH" ]]; then
+
+		if [[ -n "${SUDO_USER}" ]]; then
+
+			if [ "$(id -u)" -eq 0 ]; then
+				sudo -H -u "$SUDO_USER" -- "$TARGET_DIR/INSTALL_TOOLSPATH"
+				$TARGET_DIR/INSTALL_TOOLSPATH --sudo;
+			fi
+
+			$TARGET_DIR/INSTALL_TOOLSPATH;
+
+		else
+			if [ "$(id -u)" -eq 0 ]; then
+				$TARGET_DIR/INSTALL_TOOLSPATH --sudo;
+			fi
+			$TARGET_DIR/INSTALL_TOOLSPATH;
+		fi
+
+		echo
+		echo "unix_tools installation to $TARGET_DIR completed." 
+		echo
+	fi
+fi
+
+)
+

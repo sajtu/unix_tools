@@ -1,0 +1,277 @@
+#!/bin/sh
+
+###############################################################################
+# INSTALL_PATH
+#
+# Add a directory to the current user's PATH configuration.
+#
+# Usage:
+#   INSTALL_PATH <Path>
+#
+# Example:
+#   INSTALL_PATH /opt/tools
+###############################################################################
+
+MARKER_PREFIX='# Added by INSTALL_PATH'
+
+###############################################################################
+# Determine whether this script was sourced.
+###############################################################################
+
+IS_SOURCED='0'
+
+if [ -n "${BASH_VERSION:-}" ]; then
+	(return 0 2>/dev/null) && IS_SOURCED='1'
+elif [ -n "${ZSH_VERSION:-}" ]; then
+	case "${ZSH_EVAL_CONTEXT:-}" in
+		*:file)
+			IS_SOURCED='1'
+			;;
+	esac
+elif [ -n "${KSH_VERSION:-}" ]; then
+	(return 0 2>/dev/null) && IS_SOURCED='1'
+fi
+
+###############################################################################
+# Exit or return without terminating the user's current shell.
+###############################################################################
+
+finish()
+{
+	RC=$1
+
+	if [ "$IS_SOURCED" = '1' ]; then
+		return "$RC"
+	else
+		exit "$RC"
+	fi
+}
+
+###############################################################################
+# Display usage.
+###############################################################################
+
+usage()
+{
+	printf '\nUsage: %s <Path>\n\n' "$0" >&2
+}
+
+###############################################################################
+# Validate command-line arguments.
+###############################################################################
+
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+	printf '\nINSTALL_PATH: error: Path required.\n' >&2
+	usage
+	finish 1
+fi
+
+if [ "$#" -gt 1 ]; then
+	printf '\nINSTALL_PATH: error: Too many arguments.\n' >&2
+	usage
+	finish 1
+fi
+
+REQUESTED_PATH=$1
+
+###############################################################################
+# Validate the requested path.
+###############################################################################
+
+if [ ! -e "$REQUESTED_PATH" ]; then
+	printf "\nINSTALL_PATH: error: Path, '%s', does not exist.\n\n" \
+		"$REQUESTED_PATH" >&2
+	finish 1
+fi
+
+if [ ! -d "$REQUESTED_PATH" ]; then
+	printf "\nINSTALL_PATH: error: Path, '%s', is not a directory.\n\n" \
+		"$REQUESTED_PATH" >&2
+	finish 1
+fi
+
+###############################################################################
+# Resolve the requested directory to a physical absolute path.
+###############################################################################
+
+INSTALL_PATH_VALUE=$(
+	cd "$REQUESTED_PATH" 2>/dev/null &&
+	pwd -P
+)
+
+if [ -z "$INSTALL_PATH_VALUE" ]; then
+	printf "\nINSTALL_PATH: error: Could not resolve path, '%s'.\n\n" \
+		"$REQUESTED_PATH" >&2
+	finish 1
+fi
+
+if [ ! -x "$INSTALL_PATH_VALUE" ]; then
+	printf "\nINSTALL_PATH: error: Path, '%s', is not searchable by the current user.\n\n" \
+		"$INSTALL_PATH_VALUE" >&2
+	finish 1
+fi
+
+MARKER="${MARKER_PREFIX} ${INSTALL_PATH_VALUE}"
+
+###############################################################################
+# Check whether the directory is already in the current PATH.
+###############################################################################
+
+PATH_PRESENT='0'
+
+case ":${PATH:-}:" in
+	*:"$INSTALL_PATH_VALUE":*)
+		PATH_PRESENT='1'
+		;;
+esac
+
+###############################################################################
+# Determine the user's shell and startup file.
+###############################################################################
+
+LOGIN_SHELL=${SHELL:-/bin/sh}
+SHELL_NAME=${LOGIN_SHELL##*/}
+
+case "$SHELL_NAME" in
+	bash)
+		STARTUP_FILE="$HOME/.bashrc"
+		PATH_LINE="case \":\$PATH:\" in *:\"$INSTALL_PATH_VALUE\":*) ;; *) export PATH=\"$INSTALL_PATH_VALUE:\$PATH\" ;; esac"
+		;;
+
+	zsh)
+		STARTUP_FILE="$HOME/.zshrc"
+		PATH_LINE="case \":\$PATH:\" in *:\"$INSTALL_PATH_VALUE\":*) ;; *) export PATH=\"$INSTALL_PATH_VALUE:\$PATH\" ;; esac"
+		;;
+
+	ksh|ksh88|ksh93|mksh|pdksh)
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE="case \":\$PATH:\" in *:\"$INSTALL_PATH_VALUE\":*) ;; *) export PATH=\"$INSTALL_PATH_VALUE:\$PATH\" ;; esac"
+		;;
+
+	sh|dash|ash)
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE="case \":\$PATH:\" in *:\"$INSTALL_PATH_VALUE\":*) ;; *) export PATH=\"$INSTALL_PATH_VALUE:\$PATH\" ;; esac"
+		;;
+
+	csh)
+		STARTUP_FILE="$HOME/.cshrc"
+		PATH_LINE="if ( \"\$path\" !~ *\"$INSTALL_PATH_VALUE\"* ) set path = ( \"$INSTALL_PATH_VALUE\" \$path )"
+		;;
+
+	tcsh)
+		if [ -f "$HOME/.tcshrc" ]; then
+			STARTUP_FILE="$HOME/.tcshrc"
+		else
+			STARTUP_FILE="$HOME/.cshrc"
+		fi
+
+		PATH_LINE="if ( \"\$path\" !~ *\"$INSTALL_PATH_VALUE\"* ) set path = ( \"$INSTALL_PATH_VALUE\" \$path )"
+		;;
+
+	fish)
+		STARTUP_FILE="$HOME/.config/fish/config.fish"
+		PATH_LINE="contains -- \"$INSTALL_PATH_VALUE\" \$PATH; or set -gx PATH \"$INSTALL_PATH_VALUE\" \$PATH"
+		;;
+
+	*)
+		printf "\nINSTALL_PATH: warning: Unrecognized shell, '%s'.\n" \
+			"$LOGIN_SHELL" >&2
+		printf "Using '%s/.profile'.\n" "$HOME" >&2
+
+		STARTUP_FILE="$HOME/.profile"
+		PATH_LINE="case \":\$PATH:\" in *:\"$INSTALL_PATH_VALUE\":*) ;; *) export PATH=\"$INSTALL_PATH_VALUE:\$PATH\" ;; esac"
+		;;
+esac
+
+###############################################################################
+# Create the startup-file parent directory when needed.
+###############################################################################
+
+STARTUP_DIR=${STARTUP_FILE%/*}
+
+if [ "$STARTUP_DIR" != "$STARTUP_FILE" ] && [ ! -d "$STARTUP_DIR" ]; then
+	if ! mkdir -p "$STARTUP_DIR"; then
+		printf "\nINSTALL_PATH: error: Could not create directory, '%s'.\n\n" \
+			"$STARTUP_DIR" >&2
+		finish 1
+	fi
+fi
+
+###############################################################################
+# Check whether this exact path is already configured.
+###############################################################################
+
+ALREADY_CONFIGURED='0'
+
+if [ -f "$STARTUP_FILE" ]; then
+	if grep -F "$MARKER" "$STARTUP_FILE" >/dev/null 2>&1; then
+		ALREADY_CONFIGURED='1'
+	fi
+fi
+
+###############################################################################
+# Add the PATH configuration.
+###############################################################################
+
+if [ "$ALREADY_CONFIGURED" = '0' ]; then
+	{
+		printf '\n%s\n' "$MARKER"
+		printf '%s\n' "$PATH_LINE"
+	} >> "$STARTUP_FILE"
+
+	if [ "$?" != '0' ]; then
+		printf "\nINSTALL_PATH: error: Could not update startup file, '%s'.\n\n" \
+			"$STARTUP_FILE" >&2
+		finish 1
+	fi
+
+	printf "\nAdded '%s' to PATH configuration in:\n  %s\n" \
+		"$INSTALL_PATH_VALUE" "$STARTUP_FILE"
+else
+	printf "\nPath, '%s', is already configured in PATH in:\n  %s\n" \
+		"$INSTALL_PATH_VALUE" "$STARTUP_FILE"
+fi
+
+###############################################################################
+# Update the current shell when this script is sourced.
+###############################################################################
+
+if [ "$IS_SOURCED" = '1' ]; then
+	case ":${PATH:-}:" in
+		*:"$INSTALL_PATH_VALUE":*)
+			:
+			;;
+		*)
+			PATH="$INSTALL_PATH_VALUE:${PATH:-}"
+			export PATH
+			;;
+	esac
+
+	printf "\nCurrent shell PATH updated successfully.\n"
+	printf "Added path: %s\n\n" "$INSTALL_PATH_VALUE"
+	finish 0
+fi
+
+###############################################################################
+# An executed child process cannot modify its parent shell.
+###############################################################################
+
+if [ "$PATH_PRESENT" = '1' ]; then
+	printf "\n'%s' is already present in the current PATH.\n\n" \
+		"$INSTALL_PATH_VALUE"
+else
+	printf '\nPATH configuration completed.\n'
+	printf 'To update the current shell immediately, run:\n\n'
+
+	case "$SHELL_NAME" in
+		csh|tcsh|fish)
+			printf '  source "%s"\n\n' "$STARTUP_FILE"
+			;;
+
+		*)
+			printf '  . "%s"\n\n' "$STARTUP_FILE"
+			;;
+	esac
+fi
+
+finish 0

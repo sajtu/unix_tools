@@ -1,0 +1,1196 @@
+#!/usr/bin/env python3
+
+import argparse
+import glob
+import mimetypes
+import os
+import stat
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import NamedTuple, Optional
+
+
+class EntryInfo(NamedTuple):
+	path: str
+	name: str
+	file_stat: os.stat_result
+	is_hidden: bool
+	is_directory: bool
+	is_executable: bool
+	file_type: str
+	link_target: Optional[str]
+	link_is_broken: bool
+	link_target_is_directory: bool
+	link_target_is_executable: bool
+
+
+class OperandResult(NamedTuple):
+	paths: list[str]
+	used_pattern: bool
+	had_error: bool
+
+
+EXTENSION_TYPES = {
+	# Text and documents
+	".txt": "TXT",
+	".text": "TXT",
+	".log": "TXT",
+	".md": "TXT",
+	".markdown": "TXT",
+	".rst": "TXT",
+	".rtf": "RTF",
+	".csv": "CSV",
+	".tsv": "TSV",
+	".pdf": "PDF",
+	".doc": "DOC",
+	".docx": "DOC",
+	".odt": "ODT",
+	".xls": "XLS",
+	".xlsx": "XLS",
+	".ods": "ODS",
+	".ppt": "PPT",
+	".pptx": "PPT",
+	".odp": "ODP",
+
+	# Web and structured data
+	".htm": "HTM",
+	".html": "HTM",
+	".xhtml": "HTM",
+	".css": "CSS",
+	".xml": "XML",
+	".json": "JSN",
+	".jsonl": "JSN",
+	".yaml": "YML",
+	".yml": "YML",
+	".toml": "TOM",
+	".ini": "INI",
+	".cfg": "CFG",
+	".conf": "CFG",
+	".sql": "SQL",
+
+	# Scripts
+	".sh": "SH",
+	".bash": "SH",
+	".zsh": "SH",
+	".ksh": "SH",
+	".csh": "CSH",
+	".tcsh": "CSH",
+	".fish": "FSH",
+	".py": "PY",
+	".pyw": "PY",
+	".pl": "PL",
+	".pm": "PL",
+	".rb": "RB",
+	".php": "PHP",
+	".js": "JS",
+	".mjs": "JS",
+	".cjs": "JS",
+	".jsx": "JSX",
+	".ts": "TS",
+	".tsx": "TSX",
+	".lua": "LUA",
+	".tcl": "TCL",
+	".awk": "AWK",
+	".sed": "SED",
+	".ps1": "PS1",
+	".bat": "BAT",
+	".cmd": "CMD",
+	".vbs": "VBS",
+
+	# Source code
+	".c": "C",
+	".h": "C",
+	".cc": "C++",
+	".cpp": "C++",
+	".cxx": "C++",
+	".hpp": "C++",
+	".hh": "C++",
+	".hxx": "C++",
+	".m": "O-C",
+	".mm": "O++",
+	".java": "JAV",
+	".go": "GO",
+	".rs": "RST",
+	".swift": "SWT",
+	".kt": "KT",
+	".kts": "KT",
+	".scala": "SCL",
+	".cs": "C#",
+	".vb": "VB",
+	".asm": "ASM",
+	".s": "ASM",
+	".pas": "PAS",
+	".pp": "PAS",
+	".f": "F77",
+	".for": "F77",
+	".f90": "F90",
+	".f95": "F95",
+	".dart": "DRT",
+	".groovy": "GRV",
+	".r": "R",
+	".jl": "JUL",
+	".ex": "EX",
+	".exs": "EX",
+	".erl": "ERL",
+	".hrl": "ERL",
+	".clj": "CLJ",
+	".cljs": "CLJ",
+	".lisp": "LSP",
+	".lsp": "LSP",
+	".scm": "SCM",
+	".hs": "HS",
+	".lhs": "HS",
+	".ml": "ML",
+	".mli": "ML",
+	".fs": "F#",
+	".fsx": "F#",
+	".sol": "SOL",
+	".v": "V",
+	".vhd": "VHD",
+	".vhdl": "VHD",
+
+	# Compiled code and libraries
+	".class": "CLS",
+	".jar": "JAR",
+	".war": "WAR",
+	".exe": "EXE",
+	".com": "EXE",
+	".dll": "DLL",
+	".so": "LIB",
+	".dylib": "LIB",
+	".a": "LIB",
+	".o": "OBJ",
+	".obj": "OBJ",
+
+	# Images
+	".jpg": "JPG",
+	".jpeg": "JPG",
+	".jpe": "JPG",
+	".png": "PNG",
+	".gif": "GIF",
+	".bmp": "BMP",
+	".tif": "TIF",
+	".tiff": "TIF",
+	".webp": "WEB",
+	".svg": "SVG",
+	".ico": "ICO",
+	".heic": "HEI",
+	".heif": "HEI",
+	".raw": "RAW",
+
+	# Audio
+	".mp3": "MP3",
+	".wav": "WAV",
+	".flac": "FLC",
+	".aac": "AAC",
+	".m4a": "M4A",
+	".ogg": "OGG",
+	".opus": "OPS",
+	".wma": "WMA",
+	".mid": "MID",
+	".midi": "MID",
+
+	# Video
+	".mp4": "MP4",
+	".m4v": "MP4",
+	".mkv": "MKV",
+	".mov": "MOV",
+	".avi": "AVI",
+	".webm": "WEB",
+	".wmv": "WMV",
+	".flv": "FLV",
+	".mpeg": "MPG",
+	".mpg": "MPG",
+
+	# Archives and packages
+	".tar": "TAR",
+	".tgz": "TGZ",
+	".gz": "GZ",
+	".bz2": "BZ2",
+	".xz": "XZ",
+	".zst": "ZST",
+	".zip": "ZIP",
+	".7z": "7Z",
+	".rar": "RAR",
+	".iso": "ISO",
+	".dmg": "DMG",
+	".deb": "DEB",
+	".rpm": "RPM",
+	".pkg": "PKG",
+	".apk": "APK",
+
+	# Fonts
+	".ttf": "TTF",
+	".otf": "OTF",
+	".woff": "WOF",
+	".woff2": "WOF",
+
+	# Disk images and databases
+	".img": "IMG",
+	".vhdx": "VHD",
+	".vmdk": "VMD",
+	".qcow": "QCW",
+	".qcow2": "QCW",
+	".db": "DB",
+	".sqlite": "DB",
+	".sqlite3": "DB",
+}
+
+
+SHEBANG_TYPES = {
+	"bash": "SH",
+	"sh": "SH",
+	"dash": "SH",
+	"ash": "SH",
+	"ksh": "SH",
+	"ksh93": "SH",
+	"mksh": "SH",
+	"zsh": "SH",
+	"csh": "CSH",
+	"tcsh": "CSH",
+	"fish": "FSH",
+	"python": "PY",
+	"python2": "PY",
+	"python3": "PY",
+	"perl": "PL",
+	"ruby": "RB",
+	"node": "JS",
+	"nodejs": "JS",
+	"deno": "TS",
+	"php": "PHP",
+	"lua": "LUA",
+	"tclsh": "TCL",
+	"wish": "TCL",
+	"awk": "AWK",
+	"Rscript": "R",
+	"julia": "JUL",
+}
+
+
+SIZE_UNITS = (
+	"B",
+	"K",
+	"M",
+	"G",
+	"T",
+	"P",
+	"E",
+	"Z",
+	"Y",
+)
+
+
+def normalize_path(path: str) -> str:
+	return os.path.normpath(
+		os.path.abspath(
+			os.path.expanduser(path)
+		)
+	)
+
+
+def format_directory_path(path: str) -> str:
+	normalized = normalize_path(path)
+
+	if normalized == os.sep:
+		return os.sep
+
+	return normalized.rstrip(os.sep) + os.sep
+
+
+def format_timestamp(timestamp: float) -> str:
+	dt = datetime.fromtimestamp(timestamp)
+	date_text = f"{dt.month}/{dt.day}/{dt.strftime('%y')}"
+	time_text = dt.strftime("%I:%M %p").lstrip("0")
+	return f"{date_text} {time_text:>8}"
+
+
+def format_numeric_size(value: float) -> Optional[str]:
+	for decimals in (2, 1, 0):
+		text = f"{value:.{decimals}f}"
+
+		if "." in text:
+			text = text.rstrip("0").rstrip(".")
+
+		if len(text) <= 4:
+			return text
+
+	return None
+
+
+def format_size(size: int, width: int = 6) -> str:
+	value = float(max(size, 0))
+	unit_index = 0
+
+	while True:
+		number = format_numeric_size(value)
+
+		if number is not None and value < 10000:
+			return f"{number} {SIZE_UNITS[unit_index]}".rjust(width)
+
+		if unit_index >= len(SIZE_UNITS) - 1:
+			number = str(int(round(value)))[:4]
+			return f"{number} {SIZE_UNITS[unit_index]}".rjust(width)
+
+		value /= 1024.0
+		unit_index += 1
+
+
+def format_name(info: EntryInfo) -> str:
+	if info.file_type == "LNK":
+		name = f'"{info.name}"'
+
+		if not info.link_is_broken:
+			if info.link_target_is_directory:
+				name += "/"
+			elif info.link_target_is_executable:
+				name += "*"
+
+		operator = "!>" if info.link_is_broken else "->"
+		target = f'"{info.link_target or ""}"'
+
+		if not info.link_is_broken:
+			if info.link_target_is_directory:
+				target += "/"
+			elif info.link_target_is_executable:
+				target += "*"
+
+		return f"{name} {operator} {target}"
+
+	name = f'"{info.name}"'
+
+	if info.is_directory:
+		name += "/"
+	elif info.is_executable:
+		name += "*"
+
+	return name
+
+
+def format_permissions(mode: int) -> str:
+	mode_text = stat.filemode(mode)
+
+	return (
+		f"{mode_text[1:4]} "
+		f"{mode_text[4:7]} "
+		f"{mode_text[7:10]}"
+	)
+
+
+def format_file_type(file_type: str, width: int = 3) -> str:
+	if len(file_type) == 1:
+		return file_type.center(width)
+
+	return file_type[-width:].rjust(width)
+
+
+def is_probably_text(data: bytes) -> bool:
+	if not data:
+		return True
+
+	if b"\x00" in data:
+		return False
+
+	allowed = set(
+		b"\n\r\t\b\f"
+		+ bytes(range(32, 127))
+		+ bytes(range(128, 256))
+	)
+
+	non_text = sum(byte not in allowed for byte in data)
+	return non_text / len(data) < 0.10
+
+
+def detect_shebang(data: bytes) -> Optional[str]:
+	if not data.startswith(b"#!"):
+		return None
+
+	first_line = data.splitlines()[0].decode(
+		"utf-8",
+		errors="ignore",
+	)
+
+	parts = first_line[2:].strip().split()
+
+	if not parts:
+		return None
+
+	interpreter = os.path.basename(parts[0])
+
+	if interpreter == "env":
+		index = 1
+
+		while index < len(parts) and parts[index].startswith("-"):
+			index += 1
+
+		if index < len(parts):
+			interpreter = os.path.basename(parts[index])
+
+	return SHEBANG_TYPES.get(interpreter)
+
+
+def detect_signature(data: bytes) -> Optional[str]:
+	signatures = (
+		(b"%PDF-", "PDF"),
+		(b"\x89PNG\r\n\x1a\n", "PNG"),
+		(b"\xff\xd8\xff", "JPG"),
+		(b"GIF87a", "GIF"),
+		(b"GIF89a", "GIF"),
+		(b"PK\x03\x04", "ZIP"),
+		(b"PK\x05\x06", "ZIP"),
+		(b"PK\x07\x08", "ZIP"),
+		(b"\x7fELF", "BIN"),
+		(b"MZ", "EXE"),
+		(b"\x1f\x8b", "GZ"),
+		(b"BZh", "BZ2"),
+		(b"\xfd7zXZ\x00", "XZ"),
+		(b"7z\xbc\xaf\x27\x1c", "7Z"),
+		(b"Rar!\x1a\x07", "RAR"),
+		(b"OggS", "OGG"),
+		(b"fLaC", "FLC"),
+		(b"SQLite format 3\x00", "DB"),
+	)
+
+	for signature, file_type in signatures:
+		if data.startswith(signature):
+			return file_type
+
+	if len(data) >= 4 and data[:4] in (
+		b"\xfe\xed\xfa\xce",
+		b"\xfe\xed\xfa\xcf",
+		b"\xce\xfa\xed\xfe",
+		b"\xcf\xfa\xed\xfe",
+		b"\xca\xfe\xba\xbe",
+	):
+		return "BIN"
+
+	return None
+
+
+def detect_file_type(
+	path: str,
+	name: str,
+	file_stat: os.stat_result,
+	is_directory: bool,
+	is_executable: bool,
+) -> str:
+	mode = file_stat.st_mode
+
+	if is_directory:
+		return "-"
+
+	if stat.S_ISLNK(mode):
+		return "LNK"
+
+	if stat.S_ISFIFO(mode):
+		return "PIP"
+
+	if stat.S_ISSOCK(mode):
+		return "SOC"
+
+	if stat.S_ISCHR(mode):
+		return "CHR"
+
+	if stat.S_ISBLK(mode):
+		return "BLK"
+
+	if not stat.S_ISREG(mode):
+		return "UNK"
+
+	file_path = Path(name)
+	suffixes = [suffix.lower() for suffix in file_path.suffixes]
+
+	compound_suffixes = {
+		(".tar", ".gz"): "TGZ",
+		(".tar", ".bz2"): "TBZ",
+		(".tar", ".xz"): "TXZ",
+		(".tar", ".zst"): "TZS",
+	}
+
+	if len(suffixes) >= 2:
+		compound = tuple(suffixes[-2:])
+
+		if compound in compound_suffixes:
+			return compound_suffixes[compound]
+
+	try:
+		with open(path, "rb") as file_handle:
+			data = file_handle.read(8192)
+	except OSError:
+		data = b""
+
+	shebang_type = detect_shebang(data)
+
+	if shebang_type:
+		return shebang_type
+
+	if suffixes:
+		extension_type = EXTENSION_TYPES.get(suffixes[-1])
+
+		if extension_type:
+			return extension_type
+
+	signature_type = detect_signature(data)
+
+	if signature_type:
+		return signature_type
+
+	mime_type, _ = mimetypes.guess_type(name)
+
+	if mime_type:
+		if mime_type.startswith("text/"):
+			return "TXT"
+
+		if mime_type.startswith("image/"):
+			return "IMG"
+
+		if mime_type.startswith("audio/"):
+			return "AUD"
+
+		if mime_type.startswith("video/"):
+			return "VID"
+
+	if is_probably_text(data):
+		return "TXT"
+
+	if is_executable:
+		return "BIN"
+
+	return "BIN"
+
+
+def collect_entry(path: str) -> Optional[EntryInfo]:
+	normalized_path = normalize_path(path)
+	name = os.path.basename(normalized_path)
+
+	if not name and normalized_path == os.sep:
+		name = os.sep
+
+	try:
+		file_stat = os.lstat(normalized_path)
+	except OSError as error:
+		print(
+			f'Error: Cannot read "{normalized_path}": {error}',
+			file=sys.stderr,
+		)
+		return None
+
+	is_directory = stat.S_ISDIR(file_stat.st_mode)
+
+	is_executable = (
+		stat.S_ISREG(file_stat.st_mode)
+		and bool(file_stat.st_mode & 0o111)
+	)
+
+	file_type = detect_file_type(
+		normalized_path,
+		name,
+		file_stat,
+		is_directory,
+		is_executable,
+	)
+
+	link_target = None
+	link_is_broken = False
+	link_target_is_directory = False
+	link_target_is_executable = False
+
+	if file_type == "LNK":
+		try:
+			link_target = os.readlink(normalized_path)
+		except OSError as error:
+			link_target = f"<unreadable: {error}>"
+			link_is_broken = True
+		else:
+			try:
+				target_stat = os.stat(normalized_path)
+			except OSError:
+				link_is_broken = True
+			else:
+				link_target_is_directory = stat.S_ISDIR(
+					target_stat.st_mode
+				)
+
+				link_target_is_executable = (
+					stat.S_ISREG(target_stat.st_mode)
+					and bool(target_stat.st_mode & 0o111)
+				)
+
+	return EntryInfo(
+		path=normalized_path,
+		name=name,
+		file_stat=file_stat,
+		is_hidden=name.startswith("."),
+		is_directory=is_directory,
+		is_executable=is_executable,
+		file_type=file_type,
+		link_target=link_target,
+		link_is_broken=link_is_broken,
+		link_target_is_directory=link_target_is_directory,
+		link_target_is_executable=link_target_is_executable,
+	)
+
+
+def collect_directory(
+	directory: str,
+) -> tuple[list[EntryInfo], Optional[str]]:
+	normalized_directory = normalize_path(directory)
+	entries = []
+
+	try:
+		with os.scandir(normalized_directory) as iterator:
+			for item in iterator:
+				info = collect_entry(item.path)
+
+				if info is not None:
+					entries.append(info)
+
+	except PermissionError:
+		return [], "Error: Permission denied."
+
+	except OSError as error:
+		return [], f"Error: Cannot read directory: {error}"
+
+	return entries, None
+
+
+def expand_operands(operands: list[str]) -> OperandResult:
+	expanded_paths = []
+	used_pattern = False
+	had_error = False
+	seen = set()
+
+	for operand in operands:
+		expanded_operand = os.path.expanduser(operand)
+
+		if glob.has_magic(expanded_operand):
+			used_pattern = True
+			matches = glob.glob(expanded_operand)
+
+			if not matches:
+				print(
+					f'Error: No matches found: "{operand}"',
+					file=sys.stderr,
+				)
+				had_error = True
+				continue
+		else:
+			matches = [expanded_operand]
+
+		for match in matches:
+			normalized = normalize_path(match)
+
+			if normalized in seen:
+				continue
+
+			if not os.path.lexists(normalized):
+				print(
+					f'Error: Path does not exist: "{match}"',
+					file=sys.stderr,
+				)
+				had_error = True
+				continue
+
+			seen.add(normalized)
+			expanded_paths.append(normalized)
+
+	return OperandResult(
+		paths=expanded_paths,
+		used_pattern=used_pattern,
+		had_error=had_error,
+	)
+
+
+def category_rank(info: EntryInfo) -> int:
+	if info.is_directory:
+		return 0
+
+	if info.is_executable:
+		return 1
+
+	return 2
+
+
+def sort_group(
+	entries: list[EntryInfo],
+	sort_by_time: bool,
+	reverse: bool,
+) -> list[EntryInfo]:
+	sorted_entries = []
+
+	for category in (0, 1, 2):
+		category_entries = [
+			info
+			for info in entries
+			if category_rank(info) == category
+		]
+
+		if sort_by_time:
+			category_entries.sort(
+				key=lambda info: (
+					info.file_stat.st_mtime,
+					info.name.casefold(),
+				),
+				reverse=not reverse,
+			)
+		else:
+			category_entries.sort(
+				key=lambda info: info.name.casefold(),
+				reverse=reverse,
+			)
+
+		sorted_entries.extend(category_entries)
+
+	return sorted_entries
+
+
+def sort_entries(
+	entries: list[EntryInfo],
+	sort_by_time: bool,
+	reverse: bool,
+) -> list[EntryInfo]:
+	visible_entries = sort_group(
+		[
+			info
+			for info in entries
+			if not info.is_hidden
+		],
+		sort_by_time,
+		reverse,
+	)
+
+	hidden_entries = sort_group(
+		[
+			info
+			for info in entries
+			if info.is_hidden
+		],
+		sort_by_time,
+		reverse,
+	)
+
+	return visible_entries + hidden_entries
+
+
+def print_report(
+	title: str,
+	entries: list[EntryInfo],
+) -> None:
+	total = len(entries)
+
+	directory_count = sum(
+		1
+		for info in entries
+		if info.is_directory
+	)
+
+	file_count = total - directory_count
+
+	print()
+	print(title)
+	print("=" * len(title))
+	print(
+		f"Total: {total}    "
+		f"Directories: {directory_count}    "
+		f"Files: {file_count}"
+	)
+
+	type_counts = {}
+
+	for info in entries:
+		if info.is_directory:
+			continue
+
+		type_counts[info.file_type] = (
+			type_counts.get(info.file_type, 0) + 1
+		)
+
+	if not type_counts:
+		return
+
+	print()
+	print("File Types")
+	print("==========")
+
+	type_cells = [
+		f"{file_type}: {count}"
+		for file_type, count in sorted(type_counts.items())
+	]
+
+	cells_per_row = 4
+	cell_width = max(
+		12,
+		max(
+			(len(cell) for cell in type_cells),
+			default=0,
+		) + 2,
+	)
+
+	for index in range(0, len(type_cells), cells_per_row):
+		row = type_cells[index:index + cells_per_row]
+
+		print(
+			"".join(
+				cell.ljust(cell_width)
+				for cell in row
+			).rstrip()
+		)
+
+
+def print_table(entries: list[EntryInfo]) -> None:
+	visible_entries = [
+		info
+		for info in entries
+		if not info.is_hidden
+	]
+
+	hidden_entries = [
+		info
+		for info in entries
+		if info.is_hidden
+	]
+
+	permissions_header = "Usr Grp All"
+	permissions_width = 11
+	modified_width = 17
+	size_width = 6
+	file_type_width = 3
+
+	name_width = max(
+		len("Name"),
+		max(
+			(
+				len(format_name(info))
+				for info in entries
+			),
+			default=0,
+		),
+		20,
+	)
+
+	header = (
+		f"{permissions_header:^{permissions_width}}  "
+		f"{'Modified':^{modified_width}}  "
+		f"{'SZ':>{size_width}}  "
+		f"{'FT':>{file_type_width}}  "
+		f"{'Name':^{name_width}}"
+	)
+
+	separator = (
+		f"{'=' * permissions_width}  "
+		f"{'=' * modified_width}  "
+		f"{'=' * size_width}  "
+		f"{'=' * file_type_width}  "
+		f"{'=' * name_width}"
+	)
+
+	table_width = len(separator)
+
+	def print_entry(info: EntryInfo) -> None:
+		permissions = format_permissions(
+			info.file_stat.st_mode
+		)
+
+		modified = format_timestamp(
+			info.file_stat.st_mtime
+		)
+
+		size = format_size(
+			info.file_stat.st_size,
+			size_width,
+		)
+
+		file_type = format_file_type(
+			info.file_type,
+			file_type_width,
+		)
+
+		name = format_name(info)
+
+		print(
+			f"{permissions:<{permissions_width}}  "
+			f"{modified:>{modified_width}}  "
+			f"{size:>{size_width}}  "
+			f"{file_type}  "
+			f"{name:<{name_width}}"
+		)
+
+	print(header)
+	print(separator)
+
+	for info in visible_entries:
+		print_entry(info)
+
+	if hidden_entries:
+		label = "[Hidden:]"
+		right_width = 2
+
+		left_width = max(
+			table_width - len(label) - right_width,
+			0,
+		)
+
+		print(
+			f"{'#' * left_width}"
+			f"{label}"
+			f"{'#' * right_width}"
+		)
+
+		for info in hidden_entries:
+			print_entry(info)
+
+
+def print_section_header(directory: str) -> None:
+	print()
+	print(
+		f'Directory: "{format_directory_path(directory)}"'
+	)
+	print()
+
+
+def print_entry_section(
+	directory: str,
+	entries: list[EntryInfo],
+	sort_by_time: bool,
+	reverse: bool,
+	show_stats: bool,
+) -> list[EntryInfo]:
+	print_section_header(directory)
+
+	sorted_entries = sort_entries(
+		entries,
+		sort_by_time,
+		reverse,
+	)
+
+	if not sorted_entries:
+		print("** EMPTY DIRECTORY **")
+
+		if show_stats:
+			print_report("Section Statistics", sorted_entries)
+
+		return sorted_entries
+
+	print_table(sorted_entries)
+
+	if show_stats:
+		print_report("Section Statistics", sorted_entries)
+
+	return sorted_entries
+
+
+def print_directory_section(
+	directory: str,
+	sort_by_time: bool,
+	reverse: bool,
+	show_stats: bool,
+) -> tuple[bool, list[EntryInfo]]:
+	print_section_header(directory)
+
+	entries, error_message = collect_directory(directory)
+
+	if error_message:
+		print(error_message)
+		return False, []
+
+	sorted_entries = sort_entries(
+		entries,
+		sort_by_time,
+		reverse,
+	)
+
+	if not sorted_entries:
+		print("** EMPTY DIRECTORY **")
+
+		if show_stats:
+			print_report("Section Statistics", sorted_entries)
+
+		return True, sorted_entries
+
+	print_table(sorted_entries)
+
+	if show_stats:
+		print_report("Section Statistics", sorted_entries)
+
+	return True, sorted_entries
+
+
+def group_entries_by_parent(
+	entries: list[EntryInfo],
+) -> list[tuple[str, list[EntryInfo]]]:
+	groups = {}
+
+	for info in entries:
+		parent = os.path.dirname(info.path)
+
+		if not parent:
+			parent = os.curdir
+
+		parent = normalize_path(parent)
+
+		if parent not in groups:
+			groups[parent] = []
+
+		groups[parent].append(info)
+
+	return list(groups.items())
+
+
+def main() -> int:
+	parser = argparse.ArgumentParser(
+		prog="dir",
+		description=(
+			"Display files and directories in a formatted "
+			"human-oriented listing."
+		),
+	)
+
+	parser.add_argument(
+		"operands",
+		nargs="*",
+		help=(
+			"files, directories, or wildcard patterns; "
+			"defaults to the current directory"
+		),
+	)
+
+	parser.add_argument(
+		"-r",
+		"--reverse",
+		action="store_true",
+		help="reverse the selected sort order",
+	)
+
+	parser.add_argument(
+		"-t",
+		"--time",
+		action="store_true",
+		help="sort by modification time instead of name",
+	)
+
+	parser.add_argument(
+		"--stats",
+		action="store_true",
+		help="show statistics after each listing section",
+	)
+
+	parser.add_argument(
+		"--summary",
+		action="store_true",
+		help="show one overall summary at the end",
+	)
+
+	args = parser.parse_args()
+
+	overall_entries = []
+
+	if not args.operands:
+		success, displayed_entries = print_directory_section(
+			os.curdir,
+			args.time,
+			args.reverse,
+			args.stats,
+		)
+
+		overall_entries.extend(displayed_entries)
+
+		if args.summary:
+			print_report("Overall Summary", overall_entries)
+
+		print()
+		return 0 if success else 1
+
+	expanded = expand_operands(args.operands)
+	exit_code = 1 if expanded.had_error else 0
+
+	entries = []
+
+	for path in expanded.paths:
+		info = collect_entry(path)
+
+		if info is None:
+			exit_code = 1
+			continue
+
+		entries.append(info)
+
+	if not entries:
+		if args.summary:
+			print_report("Overall Summary", overall_entries)
+
+		print()
+		return 1
+
+	plain_single_directory = (
+		len(args.operands) == 1
+		and not expanded.used_pattern
+		and len(entries) == 1
+		and entries[0].is_directory
+	)
+
+	if plain_single_directory:
+		success, displayed_entries = print_directory_section(
+			entries[0].path,
+			args.time,
+			args.reverse,
+			args.stats,
+		)
+
+		overall_entries.extend(displayed_entries)
+
+		if args.summary:
+			print_report("Overall Summary", overall_entries)
+
+		print()
+
+		if not success:
+			return 1
+
+		return exit_code
+
+	for parent, parent_entries in group_entries_by_parent(entries):
+		displayed_entries = print_entry_section(
+			parent,
+			parent_entries,
+			args.time,
+			args.reverse,
+			args.stats,
+		)
+
+		overall_entries.extend(displayed_entries)
+
+	directories_to_expand = []
+	seen_directories = set()
+
+	for info in entries:
+		if not info.is_directory:
+			continue
+
+		if info.path in seen_directories:
+			continue
+
+		seen_directories.add(info.path)
+		directories_to_expand.append(info.path)
+
+	for directory in directories_to_expand:
+		success, displayed_entries = print_directory_section(
+			directory,
+			args.time,
+			args.reverse,
+			args.stats,
+		)
+
+		overall_entries.extend(displayed_entries)
+
+		if not success:
+			exit_code = 1
+
+	if args.summary:
+		print_report("Overall Summary", overall_entries)
+
+	print()
+	return exit_code
+
+
+if __name__ == "__main__":
+	sys.exit(main())
