@@ -30,7 +30,7 @@ Clone the repository using HTTPS:
 ```bash
 git clone https://github.com/sajtu/unix_tools.git
 cd unix_tools
-./INSTALL_TOOLS
+sudo ./INSTALL_TOOLS
 ```
 
 Or clone using SSH (requires a GitHub account with a configured SSH key):
@@ -38,8 +38,12 @@ Or clone using SSH (requires a GitHub account with a configured SSH key):
 ```bash
 git clone git@github.com:sajtu/unix_tools.git
 cd unix_tools
-./INSTALL_TOOLS
+sudo ./INSTALL_TOOLS
 ```
+
+NOTE: sudo is only required to install to paths not writable by unprivileged user.
+      Since default path is /opt/tools, it requires root or sudo.
+      You could install unix_tools to user writable path:  ./install ~/tools
 
 ---
 
